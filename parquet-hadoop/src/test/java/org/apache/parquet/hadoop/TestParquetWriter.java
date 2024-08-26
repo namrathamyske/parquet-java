@@ -39,8 +39,13 @@ import static org.junit.Assert.assertTrue;
 import com.google.common.collect.ImmutableMap;
 import java.io.File;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
@@ -50,13 +55,21 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.parquet.bytes.HeapByteBufferAllocator;
 import org.apache.parquet.bytes.TrackingByteBufferAllocator;
+import org.apache.parquet.column.ColumnDescriptor;
+import org.apache.parquet.column.Dictionary;
 import org.apache.parquet.column.Encoding;
 import org.apache.parquet.column.ParquetProperties;
 import org.apache.parquet.column.ParquetProperties.WriterVersion;
+import org.apache.parquet.column.ValuesType;
+import org.apache.parquet.column.page.DataPageV1;
+import org.apache.parquet.column.page.DictionaryPage;
+import org.apache.parquet.column.values.ValuesReader;
 import org.apache.parquet.column.values.bloomfilter.BloomFilter;
+import org.apache.parquet.column.values.plain.PlainValuesReader;
 import org.apache.parquet.example.data.Group;
 import org.apache.parquet.example.data.GroupFactory;
 import org.apache.parquet.example.data.simple.SimpleGroupFactory;
+import org.apache.parquet.format.PageHeader;
 import org.apache.parquet.hadoop.example.ExampleParquetWriter;
 import org.apache.parquet.hadoop.example.GroupReadSupport;
 import org.apache.parquet.hadoop.example.GroupWriteSupport;
@@ -65,12 +78,15 @@ import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData;
 import org.apache.parquet.hadoop.metadata.ParquetMetadata;
 import org.apache.parquet.hadoop.util.HadoopInputFile;
 import org.apache.parquet.hadoop.util.HadoopOutputFile;
+import org.apache.parquet.internal.column.columnindex.ColumnIndex;
+import org.apache.parquet.internal.column.columnindex.OffsetIndex;
 import org.apache.parquet.io.OutputFile;
 import org.apache.parquet.io.PositionOutputStream;
 import org.apache.parquet.io.api.Binary;
 import org.apache.parquet.schema.GroupType;
 import org.apache.parquet.schema.InvalidSchemaException;
 import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.Types;
 import org.junit.After;
 import org.junit.Assert;
@@ -486,6 +502,126 @@ public class TestParquetWriter {
           .withExtraMetaData(ImmutableMap.of(ParquetWriter.OBJECT_MODEL_NAME_PROP, "some-value-3"))
           .build());
     }
+  }
+
+  @Test
+  public void testAlluxioParquetRead() throws IOException {
+    String REAL_PARQUET_FILE_PATH = "/Users/n.keshavaprakash/Downloads/data/proper/dg_data_1mb_rg_1mb_page.parquet";
+    ParquetFileReader cachedReader = ParquetFileReader.open(new Configuration(), new Path(REAL_PARQUET_FILE_PATH));
+    ParquetMetadata parquetMetadata = cachedReader.getFooter();
+    MessageType schema = parquetMetadata.getFileMetaData().getSchema();
+    ColumnDescriptor daoIdColumn = schema.getColumnDescription(new String[]{"dao_id"});
+    ColumnDescriptor daoJsonStrColumn = schema.getColumnDescription(new String[]{"dao_json_str"});
+
+    String target = "006a6add3385fd6912105c35f78b3b89";
+    Binary targetBinary = encodeTargetId(target, daoIdColumn.getType());
+    BlockMetaData blockMetaData = findMatchingBlocks(parquetMetadata,daoIdColumn, targetBinary).get(0);
+    // Using first column as its dao id
+    ColumnChunkMetaData daoIdColumnChunkMetaData = blockMetaData.getColumns().get(0);
+
+    ColumnIndex columnIndex = cachedReader.readColumnIndex(daoIdColumnChunkMetaData);
+    List<ByteBuffer> maxVals = columnIndex.getMinValues();
+    List<ByteBuffer> minVals = columnIndex.getMaxValues();
+
+    // Max and Min vals of each page for a column in a row group
+    long firstRowIndexOfPage = 0;
+    OffsetIndex offsetIndex = cachedReader.readOffsetIndex(daoIdColumnChunkMetaData);
+    long startPageIndex = 0;
+    for (int i=0 ; i < minVals.size(); i++) {
+      String minVal = String.valueOf(StandardCharsets.UTF_8.decode(minVals.get(i)));
+      String maxVal = String.valueOf(StandardCharsets.UTF_8.decode(maxVals.get(i)));
+      String minValString = String.valueOf(minVal);
+      String maxValString = String.valueOf(maxVal);
+      if(minValString.compareTo(target) >= 0 && target.compareTo(maxValString) >= 0)
+      {
+        startPageIndex = offsetIndex.getOffset(i);
+        firstRowIndexOfPage = offsetIndex.getFirstRowIndex(i);
+        break;
+      }
+
+    }
+
+    DataPageV1 dataPageV1 = cachedReader.readRequiredPagePageData(daoIdColumnChunkMetaData, startPageIndex);
+    ByteBuffer buffer = dataPageV1.getBytes().toByteBuffer();
+    ValuesReader valuesReader;
+    Encoding valueEncoding = dataPageV1.getValueEncoding();
+    valuesReader = valueEncoding.getValuesReader(daoIdColumn, ValuesType.VALUES);
+
+    valuesReader.initFromPage(dataPageV1.getValueCount(), buffer.array(), buffer.position());
+
+    int totalRows = 0;
+    // Iterate over values to find targetBinary
+    for (int j = 0; j < dataPageV1.getValueCount(); j++) {
+      Binary currentValue = valuesReader.readBytes();
+      if (currentValue.equals(targetBinary)) {
+        totalRows = j;
+        break;
+      }
+    }
+
+    ColumnChunkMetaData daoJsonStrColumnChunkMetaData = blockMetaData.getColumns().get(1);
+    OffsetIndex offsetIndexDoaStr = cachedReader.readOffsetIndex(daoJsonStrColumnChunkMetaData);
+
+
+    startPageIndex = 0;
+    int targetIndex = 0;
+    for (int j = 0 ; j < offsetIndexDoaStr.getPageCount(); j++) {
+      if(offsetIndexDoaStr.getFirstRowIndex(j) == firstRowIndexOfPage) {
+        startPageIndex = offsetIndexDoaStr.getOffset(j);
+        targetIndex = j;
+        break;
+      }
+    }
+
+    int offsetWithinPage  = totalRows - targetIndex;
+
+    dataPageV1 = cachedReader.readRequiredPagePageData(daoJsonStrColumnChunkMetaData, startPageIndex);
+
+    if (dataPageV1 instanceof DataPageV1) {
+      DataPageV1 pageV1 = (DataPageV1) dataPageV1;
+      buffer = pageV1.getBytes().toByteBuffer();
+
+      // Handle dictionary encoding if present
+      valueEncoding = pageV1.getValueEncoding();
+      valuesReader = valueEncoding.getValuesReader(daoJsonStrColumn, null);
+
+      valuesReader.initFromPage(pageV1.getValueCount(), buffer.array(), buffer.position());
+
+      // Skip directly to the offset within the page
+      for (int j = 0; j < offsetWithinPage; j++) {
+        valuesReader.skip();
+      }
+
+      // Read the target value
+      Binary daoJsonStrBinary = valuesReader.readBytes();
+      System.out.println(daoJsonStrBinary.toStringUsingUTF8());
+    }
+
+  }
+
+  private static List<BlockMetaData> findMatchingBlocks(ParquetMetadata parquetMetadata, ColumnDescriptor daoIdColumn, Binary targetBinary) {
+
+    List<BlockMetaData> matchingBlocks = Collections.synchronizedList(new ArrayList<>());
+    parquetMetadata.getBlocks().parallelStream().forEach(blockMetaData -> {
+      for (ColumnChunkMetaData columnMetaData : blockMetaData.getColumns()) {
+        if (columnMetaData.getPath().toDotString().equals("dao_id")) {
+          if (columnMetaData.getStatistics().compareMinToValue(targetBinary) <= 0 &&
+              columnMetaData.getStatistics().compareMaxToValue(targetBinary) >= 0) {
+            matchingBlocks.add(blockMetaData);
+          }
+        }
+      }
+    });
+
+    return matchingBlocks;
+  }
+
+  private static Binary encodeTargetId(String targetDaoId, PrimitiveType.PrimitiveTypeName type) throws IOException {
+    if (type == PrimitiveType.PrimitiveTypeName.BINARY || type == PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY) {
+      return Binary.fromString(targetDaoId);
+    }
+
+    throw new IllegalArgumentException("Unsupported encoding type for dao_id column.");
   }
 
   private void testParquetFileNumberOfBlocks(

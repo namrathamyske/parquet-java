@@ -1069,6 +1069,110 @@ public class ParquetFileReader implements Closeable {
     return currentRowGroup;
   }
 
+  /**
+   * Reads and decompresses a dictionary page for the given column chunk.
+   * <p>
+   * Returns null if the given column chunk has no dictionary page.
+   *
+   * @param meta a column's ColumnChunkMetaData to read the dictionary from
+   * @return an uncompressed DictionaryPage or null
+   * @throws IOException if there is an error while reading the dictionary
+   */
+  DataPageV1 readRequiredPagePageData(ColumnChunkMetaData meta, long startingOffset) throws IOException {
+    f.seek(startingOffset);
+
+    boolean encryptedColumn = false;
+    InternalColumnDecryptionSetup columnDecryptionSetup = null;
+    if (null != fileDecryptor && !fileDecryptor.plaintextFile()) {
+      columnDecryptionSetup = fileDecryptor.getColumnSetup(meta.getPath());
+      if (columnDecryptionSetup.isEncrypted()) {
+        encryptedColumn = true;
+      }
+    }
+
+    PageHeader pageHeader;
+    if (!encryptedColumn) {
+      pageHeader = Util.readPageHeader(f);
+    } else {
+      byte[] pageHeaderAAD = AesCipher.createModuleAAD(
+          fileDecryptor.getFileAAD(),
+          ModuleType.DataPageHeader,
+          meta.getRowGroupOrdinal(),
+          columnDecryptionSetup.getOrdinal(),
+          -1);
+      pageHeader = Util.readPageHeader(f, columnDecryptionSetup.getMetaDataDecryptor(), pageHeaderAAD);
+      BlockCipher.Decryptor pageDecryptor;
+      byte[] pageAAD = AesCipher.createModuleAAD(
+          fileDecryptor.getFileAAD(),
+          ModuleType.DataPage,
+          meta.getRowGroupOrdinal(),
+          columnDecryptionSetup.getOrdinal(),
+          -1);
+      pageDecryptor = columnDecryptionSetup.getDataDecryptor();
+    }
+
+    DataPageHeader dataPageHeader = pageHeader.getData_page_header();
+    int uncompressedPageSize = pageHeader.getUncompressed_page_size();
+    int compressedPageSize = pageHeader.getCompressed_page_size();
+
+    byte[] bytes = new byte[compressedPageSize];
+
+    f.read(bytes, 0, compressedPageSize);
+
+    BytesInput bin = BytesInput.from(bytes);
+
+    ColumnPath pathKey = meta.getPath();
+    ColumnDescriptor columnDescriptor = paths.get(pathKey);
+    BytesInputDecompressor decompressor = options.getCodecFactory().getDecompressor(meta.getCodec());
+    PrimitiveType type = columnDescriptor.getPrimitiveType();
+
+    return new DataPageV1(decompressor.decompress(bin, uncompressedPageSize),dataPageHeader.getNum_values(),uncompressedPageSize,converter.fromParquetStatistics(
+        getFileMetaData().getCreatedBy(), dataPageHeader.getStatistics(), type),
+        converter.getEncoding(dataPageHeader.getRepetition_level_encoding()),
+        converter.getEncoding(dataPageHeader.getDefinition_level_encoding()),
+        converter.getEncoding(dataPageHeader.getEncoding()
+        ));
+
+  }
+
+  private DataPageV1 readCompressedPage(
+      PageHeader pageHeader,
+      ColumnChunkMetaData meta)
+      throws IOException {
+
+    BlockCipher.Decryptor pageDecryptor;
+    InternalColumnDecryptionSetup columnDecryptionSetup = null;
+
+    byte[] pageAAD = AesCipher.createModuleAAD(
+        fileDecryptor.getFileAAD(),
+        ModuleType.DataPage,
+        meta.getRowGroupOrdinal(),
+        columnDecryptionSetup.getOrdinal(),
+        -1);
+    pageDecryptor = columnDecryptionSetup.getDataDecryptor();
+
+    DataPageHeader dataPageHeader = pageHeader.getData_page_header();
+    int uncompressedPageSize = pageHeader.getUncompressed_page_size();
+    int compressedPageSize = pageHeader.getCompressed_page_size();
+
+    BytesInput bin = BytesInput.from(f, compressedPageSize);
+
+    if (null != pageDecryptor) {
+      bin = BytesInput.from(pageDecryptor.decrypt(bin.toByteArray(), pageAAD));
+    }
+    ColumnPath pathKey = meta.getPath();
+    ColumnDescriptor columnDescriptor = paths.get(pathKey);
+    BytesInputDecompressor decompressor = options.getCodecFactory().getDecompressor(meta.getCodec());
+    PrimitiveType type = columnDescriptor.getPrimitiveType();
+
+    return new DataPageV1(decompressor.decompress(bin, uncompressedPageSize),dataPageHeader.getNum_values(),uncompressedPageSize,converter.fromParquetStatistics(
+        getFileMetaData().getCreatedBy(), dataPageHeader.getStatistics(), type),
+            converter.getEncoding(dataPageHeader.getRepetition_level_encoding()),
+        converter.getEncoding(dataPageHeader.getDefinition_level_encoding()),
+        converter.getEncoding(dataPageHeader.getEncoding()
+        ));
+  }
+
   private ColumnChunkPageReadStore internalReadRowGroup(int blockIndex) throws IOException {
     if (blockIndex < 0 || blockIndex >= blocks.size()) {
       return null;
